@@ -1,71 +1,190 @@
 from io import BytesIO
 import os
 from tempfile import NamedTemporaryFile
+import tkinter as tk
+from tkinter import Event
+from typing import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 
-from PIL import Image
+from PIL import Image, ImageTk
 import requests
 from plexapi.server import PlexServer
 from plexapi.video import Movie
+from plexapi.library import MovieSection
 from dotenv import load_dotenv
 
 load_dotenv()
-PLEX_TOKEN = os.getenv("PLEX_TOKEN")
-TPDB_TOKEN = os.getenv("TPDB_TOKEN")
 
-ITEM_NAME = input("Item Name: ")
+with open("completed.json", "r") as f:
+    completed = json.load(f)
 
-if not PLEX_TOKEN:
-    os.abort()
+def update_completed(data: dict):
+    with open("completed.json", "w") as f:
+        json.dump(data, f, indent = 4)
 
-plex = PlexServer("http://192.168.0.103:32400", PLEX_TOKEN)
-library = plex.library.section("JAV")
-item: Movie = library.get(ITEM_NAME)
-
-if not isinstance(item, Movie):
-    os.abort()
-
-r = requests.get(
-    url = "https://api.theporndb.net/jav",
-    params = {
-        "parse": ITEM_NAME
-    },
-    headers = {
-        "Authorization": f"Bearer {TPDB_TOKEN}"
-    }
-)
-
-r = r.json()["data"][0]
-background = r["background"]["full"]
-
-with requests.get(url = background, stream = True) as r:
-    r.raise_for_status()
+def get_plex_items() -> list[Movie]:
+    PLEX_TOKEN = os.getenv("PLEX_TOKEN")
     
-    image_bytes = BytesIO(r.content)
+    plex = PlexServer("http://192.168.0.103:32400", PLEX_TOKEN)
+    library: MovieSection = plex.library.section("JAV")
 
-image = Image.open(image_bytes)
+    return library.all()
 
-width, height = image.size
-target_ratio = 2 / 3
-current_ratio = width / height
-if current_ratio <= target_ratio:
-    os.abort()
+def get_poster(title: str) -> BytesIO | None:
+    TPDB_TOKEN = os.getenv("TPDB_TOKEN")
+    
+    r = requests.get(
+        url = "https://api.theporndb.net/jav",
+        params = {
+            "parse": title
+        },
+        headers = {
+            "Authorization": f"Bearer {TPDB_TOKEN}"
+        }
+    )
 
-target_width = round(height * target_ratio)
-image = image.crop(
-    (width - target_width, 0, width, height)
-)
-image.show()
+    try:
+        r = r.json()["data"][0]
+        background = r["background"]["full"]
+    except IndexError:
+        return None
+    
+    if not background:
+        return None
+    
+    with requests.get(url = background, stream = True) as r:
+        r.raise_for_status()
+        
+        return BytesIO(r.content)
 
-upload = input("Upload? ")
+def crop_poster(poster: BytesIO) -> Image.Image:
+    image = Image.open(poster)
+    
+    width, height = image.size
+    target_ratio = 2 / 3
+    current_ratio = width / height
+    if current_ratio <= target_ratio:
+        os.abort()
 
-if upload != "1":
-    os.abort()
+    target_width = round(height * target_ratio)
+    image = image.crop(
+        (
+            max(0, width - target_width - 18),
+            0,
+            width,
+            height
+        )
+    )
+    
+    return image
 
-with NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
-    temp_path = temp.name
-
-try:
+def upload(item: Movie, image: Image.Image):
+    with NamedTemporaryFile(suffix=".jpg", delete=False) as temp:
+        temp_path = temp.name
+        
     image.convert("RGB").save(temp_path, format="JPEG")
     item.uploadPoster(filepath = temp_path)
-finally:
+
     os.remove(temp_path)
+    
+def review_images(
+    items: Iterable[tuple[Image.Image, Movie]]
+) -> None:
+    items = list(items)
+    index = 0
+    
+    root = tk.Tk()
+    root.title("Poster Review")
+    
+    image_label = tk.Label(root)
+    image_label.pack()
+    
+    title_label = tk.Label(root)
+    title_label.pack()
+    
+    def show_current() -> None:
+        nonlocal index
+
+        if index >= len(items):
+            root.destroy()
+            return
+        
+        image, item = items[index]
+        
+        photo = ImageTk.PhotoImage(image)
+        
+        image_label.configure(image = photo)
+        image_label.image = photo
+
+        title_label.configure(
+            text=f"{index + 1}/{len(items)} - {item.title}\n"
+                 "ENTER = Upload | S = Skip | ESC = Quit"
+        )
+    
+    def handle_key(event: tk.Event) -> None:
+        nonlocal index
+
+        if index >= len(items):
+            return
+
+        image, item = items[index]
+
+        if event.keysym == "Return":
+            print(f"Uploading: {item.title}")
+
+            upload(item, image)
+            completed["items"].append(item.title)
+            update_completed(completed)
+
+            index += 1
+            show_current()
+
+        elif event.keysym.lower() == "s":
+            print(f"Skipping: {item.title}")
+
+            index += 1
+            show_current()
+
+        elif event.keysym == "Escape":
+            root.destroy()
+        
+    root.bind("<Key>", handle_key)
+    root.focus_force()
+
+    show_current()
+    root.mainloop()
+
+def handle_item(item: Movie) -> tuple[Image.Image, Movie] | None:
+    poster = get_poster(item.title)
+    if not poster: return None
+    poster = crop_poster(poster)
+    
+    return (poster, item)
+
+items = []
+index = 1
+with ThreadPoolExecutor(20) as executor:
+    plex_items = get_plex_items()
+    
+    futures = [
+        executor.submit(handle_item, item)
+        for item in plex_items
+        if item.title not in completed["items"]
+    ]
+    
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+        
+        except Exception as e:
+            continue
+        
+        if not result: continue
+        
+        image, item = result
+        items.append((image, item))
+        print(f"{f'{index}/{len(plex_items)}':<15} Completed")
+        index += 1
+
+review_images(items)
